@@ -50,4 +50,20 @@ struct OBSWebSocketParsingTests {
 
     #expect(sceneList == ["Scene"])
   }
+
+  @Test func readsTheSceneListWhenOBSReportsNoCurrentScene() {
+    var sceneList: [String] = []
+    var currentSceneName = "Kept"
+
+    OBSWebSocket.parseGetSceneListResponse(
+      [
+        "responseData": [
+          "currentProgramSceneName": jsonNull,
+          "scenes": [["sceneName": "Scene"], ["sceneName": "Discord"]],
+        ]
+      ] as [String: AnyObject], sceneList: &sceneList, currentSceneName: &currentSceneName)
+
+    #expect(sceneList == ["Scene", "Discord"])
+    #expect(currentSceneName == "Kept")
+  }
 }

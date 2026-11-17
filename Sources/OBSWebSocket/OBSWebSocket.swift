@@ -45,7 +45,31 @@ public class OBSWebSocket: WebSocket {
 
   @ObservationIgnored private var isReadyForRequests: Bool = false
 
+  @ObservationIgnored private var requestedRpcVersion: Int = 0
+
   private static let notReadyForRequestsMessage = "OBS WebSocket is not ready to receive requests."
+
+  /// The newest protocol version this client speaks. OBS announces its own in `Hello`.
+  public nonisolated static let supportedRpcVersion = 1
+
+  /// The `Scenes` event category, the only one this client reads.
+  nonisolated static let sceneEventSubscription = 1 << 2
+
+  /// The `Identify` message for a server that announced `serverRpcVersion`.
+  nonisolated static func identifyMessage(
+    serverRpcVersion: Int, authentication: String?
+  ) -> [String: Any] {
+    var data: [String: Any] = [
+      "rpcVersion": min(serverRpcVersion, supportedRpcVersion),
+      "eventSubscriptions": sceneEventSubscription,
+    ]
+
+    if let authentication {
+      data["authentication"] = authentication
+    }
+
+    return ["op": OpCode.identify, "d": data]
+  }
 
   override public func handleMessage(_ message: String) {
     do {
@@ -63,6 +87,7 @@ public class OBSWebSocket: WebSocket {
 
       if let rpcVersion = d["rpcVersion"] as? Int {
         self.rpcVersion = rpcVersion
+        requestedRpcVersion = min(rpcVersion, OBSWebSocket.supportedRpcVersion)
 
         if d["authentication"] is [String: String] {
           OBSWebSocket.parseAuthentication(
@@ -74,21 +99,13 @@ public class OBSWebSocket: WebSocket {
               password: authenticationPassword, salt: authenticationSalt,
               challenge: authenticationChallenge)
 
-            sendDictionary([
-              "op": OpCode.identify,
-              "d": [
-                "rpcVersion": rpcVersion,
-                "authentication": authentication,
-              ],
-            ])
+            sendDictionary(
+              OBSWebSocket.identifyMessage(
+                serverRpcVersion: rpcVersion, authentication: authentication))
           }
         } else {
-          sendDictionary([
-            "op": OpCode.identify,
-            "d": [
-              "rpcVersion": rpcVersion
-            ],
-          ])
+          sendDictionary(
+            OBSWebSocket.identifyMessage(serverRpcVersion: rpcVersion, authentication: nil))
         }
 
         if d["obsWebSocketVersion"] is String {
@@ -99,7 +116,7 @@ public class OBSWebSocket: WebSocket {
           obsWebSocketVersion = "\(versionMajor).\(versionMinor).\(versionPatch)"
         }
       } else if let negotiatedRpcVersion = d["negotiatedRpcVersion"] as? Int {
-        if negotiatedRpcVersion != rpcVersion {
+        if negotiatedRpcVersion != requestedRpcVersion {
           disconnect()
 
           return
@@ -143,10 +160,11 @@ public class OBSWebSocket: WebSocket {
     _ d: [String: AnyObject], sceneList: inout [String], currentSceneName: inout String
   ) {
     if let responseData = d["responseData"],
-      let sceneName = responseData["currentProgramSceneName"] as? String,
       let scenes = responseData["scenes"] as? [AnyObject]
     {
-      currentSceneName = sceneName
+      if let sceneName = responseData["currentProgramSceneName"] as? String {
+        currentSceneName = sceneName
+      }
 
       if !scenes.isEmpty {
         sceneList = scenes.compactMap { ($0 as? [String: Any])?["sceneName"] as? String }
