@@ -1,75 +1,73 @@
 import Foundation
+import OSLog
+import Observation
 
-@available(macOS 10.15, *)
-public class WebSocket: NSObject, IWebSocket, ObservableObject, URLSessionWebSocketDelegate {
-  @Published public var state: WebSocketState = .None
+private let logger = Logger(subsystem: "pro.omny.OBSWebSocket", category: "WebSocket")
 
-  internal var webSocketTask: URLSessionWebSocketTask?
+/// A WebSocket client whose state SwiftUI can observe.
+@MainActor @Observable
+public class WebSocket {
+  public var state: WebSocketState = .idle
 
-  private let timeoutInSeconds: Double = 5
+  /// How long a connection may stay in `.startingUp` before it is given up.
+  public var connectionTimeout: TimeInterval = 5
 
-  private var timeoutDispatch: DispatchWorkItem?
+  @ObservationIgnored private var session: URLSession?
+  @ObservationIgnored private var webSocketTask: URLSessionWebSocketTask?
+  @ObservationIgnored private var timeoutTask: Task<Void, Never>?
+
+  public init() {}
+
+  /// The WebSocket URL for a host the user typed, or `nil` when the host cannot form one.
+  nonisolated static func makeURL(host: String, port: Int) -> URL? {
+    let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    guard !trimmed.isEmpty else { return nil }
+
+    let isBareIPv6 = trimmed.contains(":") && !trimmed.hasPrefix("[")
+
+    return URL(string: "ws://\(isBareIPv6 ? "[\(trimmed)]" : trimmed):\(port)")
+  }
 
   public func connect(host: String = "localhost", port: Int = 4455) {
     disconnect()
 
-    let session = URLSession(
-      configuration: .default, delegate: self, delegateQueue: OperationQueue())
-
-    webSocketTask = session.webSocketTask(with: URL(string: "ws://\(host):\(port)")!)
-
-    state = .StartingUp
-
-    webSocketTask?.resume()
-
-    receiveMessage()
-
-    timeoutDispatch = DispatchWorkItem { [weak self] in
-      if self?.webSocketTask?.state != URLSessionTask.State.running {
-        self?.disconnect()
-      }
+    guard let url = WebSocket.makeURL(host: host, port: port) else {
+      state = .disconnected
+      return
     }
 
-    DispatchQueue.global().asyncAfter(
-      deadline: .now() + timeoutInSeconds,
-      execute: timeoutDispatch!)
-  }
+    let session = URLSession(
+      configuration: .default, delegate: SessionDelegate(socket: self), delegateQueue: nil)
+    let task = session.webSocketTask(with: url)
 
-  public func receiveMessage() {
-    webSocketTask?.receive { [weak self] result in
-      switch result {
-      case .success(let message):
-        switch message {
-        case .string(let text):
-          self?.handleMessage(text)
-        default:
-          break
-        }
+    self.session = session
+    webSocketTask = task
+    state = .startingUp
 
-        if self?.webSocketTask?.state == URLSessionTask.State.running {
-          self?.receiveMessage()
-        }
+    task.resume()
 
-      case .failure(let error):
-        print(error.localizedDescription)
-      }
+    receiveMessage(from: task)
+
+    timeoutTask = Task { [weak self, connectionTimeout] in
+      try? await Task.sleep(for: .seconds(connectionTimeout))
+
+      guard !Task.isCancelled else { return }
+
+      self?.connectionTimedOut(task)
     }
   }
 
   public func handleMessage(_ message: String) {
-    print(message)
+    logger.debug("Received a message: \(message, privacy: .private)")
   }
 
   public func sendMessage(_ message: String) {
-    if webSocketTask?.state != URLSessionTask.State.running {
-      return
-    }
+    guard let task = webSocketTask, task.state == .running else { return }
 
-    let message = URLSessionWebSocketTask.Message.string(message)
-
-    webSocketTask?.send(message) { error in
-      if let error = error {
-        print(error.localizedDescription)
+    task.send(.string(message)) { error in
+      if let error {
+        logger.error("Sending failed: \(error.localizedDescription, privacy: .public)")
       }
     }
   }
@@ -82,56 +80,122 @@ public class WebSocket: NSObject, IWebSocket, ObservableObject, URLSessionWebSoc
         sendMessage(jsonString)
       }
     } catch {
-      print(error.localizedDescription)
-    }
-  }
-
-  public func urlSession(
-    _ session: URLSession, webSocketTask: URLSessionWebSocketTask,
-    didOpenWithProtocol protocol: String?
-  ) {
-    DispatchQueue.main.async {
-      self.state = .Connected
-
-      self.timeoutDispatch?.cancel()
-    }
-  }
-
-  public func urlSession(
-    _ session: URLSession, webSocketTask: URLSessionWebSocketTask,
-    didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?
-  ) {
-    DispatchQueue.main.async {
-      self.disconnect()
-    }
-  }
-
-  public func urlSession(
-    _ session: URLSession, webSocketTask: URLSessionTask,
-    didCompleteWithError error: Error?
-  ) {
-    if error != nil {
-      DispatchQueue.main.async {
-        self.disconnect()
-      }
+      logger.error("Encoding failed: \(error.localizedDescription, privacy: .public)")
     }
   }
 
   public func disconnect() {
-    if self.state != .Connected {
-      return
-    }
+    guard state == .connected || state == .startingUp else { return }
 
-    self.state = .Disconnected
+    state = .disconnected
 
-    timeoutDispatch?.cancel()
+    timeoutTask?.cancel()
+    timeoutTask = nil
 
     webSocketTask?.cancel(with: .normalClosure, reason: nil)
+    webSocketTask = nil
+
+    session?.finishTasksAndInvalidate()
+    session = nil
   }
 
-  deinit {
-    timeoutDispatch?.cancel()
-
+  isolated deinit {
+    timeoutTask?.cancel()
     webSocketTask?.cancel(with: .goingAway, reason: nil)
+    session?.finishTasksAndInvalidate()
+  }
+
+  private func receiveMessage(from task: URLSessionWebSocketTask) {
+    task.receive { [weak self] result in
+      Task { @MainActor in
+        self?.received(result, from: task)
+      }
+    }
+  }
+
+  private func received(
+    _ result: Result<URLSessionWebSocketTask.Message, Error>, from task: URLSessionWebSocketTask
+  ) {
+    guard task === webSocketTask else { return }
+
+    switch result {
+    case .success(let message):
+      if case .string(let text) = message {
+        handleMessage(text)
+      }
+
+      if task.state == .running {
+        receiveMessage(from: task)
+      }
+
+    case .failure(let error):
+      logger.error("Receiving failed: \(error.localizedDescription, privacy: .public)")
+    }
+  }
+
+  private func connectionTimedOut(_ task: URLSessionWebSocketTask) {
+    guard task === webSocketTask, state == .startingUp else { return }
+
+    disconnect()
+  }
+
+  fileprivate func connectionOpened(_ task: URLSessionTask) {
+    guard task === webSocketTask else { return }
+
+    state = .connected
+
+    timeoutTask?.cancel()
+  }
+
+  fileprivate func connectionEnded(_ task: URLSessionTask) {
+    guard task === webSocketTask else { return }
+
+    disconnect()
+  }
+}
+
+/// Reports what URLSession says about one connection back to the socket on the main actor.
+///
+/// Every callback names the task it came from. The socket ignores a task it has already
+/// replaced, so a late failure from an old connection cannot end the new one.
+private final class SessionDelegate: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
+  private weak var socket: WebSocket?
+
+  init(socket: WebSocket) {
+    self.socket = socket
+  }
+
+  func urlSession(
+    _ session: URLSession, webSocketTask: URLSessionWebSocketTask,
+    didOpenWithProtocol protocol: String?
+  ) {
+    let socket = socket
+
+    Task { @MainActor in
+      socket?.connectionOpened(webSocketTask)
+    }
+  }
+
+  func urlSession(
+    _ session: URLSession, webSocketTask: URLSessionWebSocketTask,
+    didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?
+  ) {
+    let socket = socket
+
+    Task { @MainActor in
+      socket?.connectionEnded(webSocketTask)
+    }
+  }
+
+  func urlSession(
+    _ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?
+  ) {
+    guard error != nil else { return }
+
+    let socket = socket
+
+    Task { @MainActor in
+      socket?.connectionEnded(task)
+    }
   }
 }
