@@ -261,7 +261,8 @@ public class OBSWebSocket: WebSocket {
     ])
   }
 
-  public func requestSetSceneTransitionOverride(_ sceneName: String, transitionName: String = "Cut") {
+  public func requestSetSceneTransitionOverride(_ sceneName: String, transitionName: String = "Cut")
+  {
     if !isReadyForRequests {
       print(notReadyForRequestsMessage)
 
