@@ -55,14 +55,7 @@ public class WebSocket {
       return
     }
 
-    let options = NWProtocolWebSocket.Options()
-    options.autoReplyPing = true
-    options.maximumMessageSize = WebSocket.maximumMessageSize
-
-    let parameters = NWParameters.tcp
-    parameters.defaultProtocolStack.applicationProtocols.insert(options, at: 0)
-
-    let connection = NWConnection(to: .url(url), using: parameters)
+    let connection = NWConnection(to: .url(url), using: WebSocketConnectionParameters.make())
 
     self.connection = connection
     state = .startingUp
