@@ -32,11 +32,24 @@ final class WebSocketServer: @unchecked Sendable {
       server?.accept(connection)
     }
 
-    let port: NWEndpoint.Port = await withCheckedContinuation { continuation in
+    let port: NWEndpoint.Port = try await withCheckedThrowingContinuation { continuation in
       listener.stateUpdateHandler = { state in
-        if case .ready = state, let port = listener.port {
+        switch state {
+        case .ready:
           listener.stateUpdateHandler = nil
-          continuation.resume(returning: port)
+
+          if let port = listener.port {
+            continuation.resume(returning: port)
+          } else {
+            continuation.resume(throwing: NWError.posix(.EINVAL))
+          }
+
+        case .failed(let error):
+          listener.stateUpdateHandler = nil
+          continuation.resume(throwing: error)
+
+        default:
+          break
         }
       }
       listener.start(queue: server.queue)
@@ -138,11 +151,24 @@ final class RequestRecorder: @unchecked Sendable {
       recorder?.accept(connection)
     }
 
-    let port: NWEndpoint.Port = await withCheckedContinuation { continuation in
+    let port: NWEndpoint.Port = try await withCheckedThrowingContinuation { continuation in
       listener.stateUpdateHandler = { state in
-        if case .ready = state, let port = listener.port {
+        switch state {
+        case .ready:
           listener.stateUpdateHandler = nil
-          continuation.resume(returning: port)
+
+          if let port = listener.port {
+            continuation.resume(returning: port)
+          } else {
+            continuation.resume(throwing: NWError.posix(.EINVAL))
+          }
+
+        case .failed(let error):
+          listener.stateUpdateHandler = nil
+          continuation.resume(throwing: error)
+
+        default:
+          break
         }
       }
       listener.start(queue: recorder.queue)

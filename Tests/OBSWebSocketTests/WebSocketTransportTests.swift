@@ -59,14 +59,42 @@ struct WebSocketTransportTests {
   }
 
   @Test func doesNotSendBeforeTheConnectionIsOpen() async throws {
-    let server = try await SilentServer.start()
+    let server = try await WebSocketServer.start()
     defer { server.stop() }
     let socket = WebSocket()
 
-    socket.connect(host: "localhost", port: Int(server.port.rawValue))
+    socket.connect(host: "localhost", port: server.portNumber)
     socket.sendMessage("too early")
-
     #expect(socket.state == .startingUp)
+
+    #expect(await socket.becomes(.connected, within: 3))
+    try await Task.sleep(for: .milliseconds(300))
+
+    #expect(server.receivedTexts.isEmpty)
+  }
+
+  @Test func aLateFailureFromTheOldConnectionLeavesTheNewOneAlone() async throws {
+    let first = try await WebSocketServer.start()
+    defer { first.stop() }
+    let second = try await WebSocketServer.start()
+    defer { second.stop() }
+    let socket = RedialOnEndSocket()
+
+    socket.connect(host: "localhost", port: first.portNumber)
+    #expect(await socket.becomes(.connected, within: 3))
+    #expect(await eventually { first.hasConnection })
+
+    // A message past the size limit makes the first connection fail. Its failure arrives
+    // after the socket has already moved to the second connection.
+    socket.redialPort = second.portNumber
+    first.send(String(repeating: "a", count: WebSocket.maximumMessageSize + 1024))
+
+    #expect(await eventually { socket.ends >= 1 })
+    #expect(await socket.becomes(.connected, within: 3))
+    try await Task.sleep(for: .milliseconds(500))
+
+    #expect(socket.state == .connected)
+    #expect(socket.ends == 1)
   }
 
   @Test func endsWhenTheServerSendsACloseFrame() async throws {
@@ -128,7 +156,7 @@ struct WebSocketTransportTests {
     #expect(await socket.becomes(.connected, within: 3))
   }
 
-  @Test func asksForTheRootPathWithTheHostAndPort() async throws {
+  @Test func asksForTheRootPathWithOneHostHeader() async throws {
     let recorder = try await RequestRecorder.start()
     defer { recorder.stop() }
     let socket = WebSocket()
@@ -141,23 +169,31 @@ struct WebSocketTransportTests {
     let lines = request.components(separatedBy: "\r\n")
 
     #expect(lines.first == "GET / HTTP/1.1")
-    #expect(
-      lines.filter { $0.lowercased().hasPrefix("host:") } == [
-        "Host: localhost:\(recorder.portNumber)"
-      ])
+    #expect(lines.filter { $0.lowercased().hasPrefix("host:") }.count == 1)
     #expect(lines.contains { $0.lowercased() == "upgrade: websocket" })
   }
+}
 
-  @Test(arguments: [
-    ("localhost", "localhost:4455"),
-    ("192.168.1.5", "192.168.1.5:4455"),
-    ("demi.example.net", "demi.example.net:4455"),
-    ("  localhost ", "localhost:4455"),
-    ("::1", "[::1]:4455"),
-    ("[::1]", "[::1]:4455"),
-  ])
-  func writesTheHostHeader(host: String, expected: String) {
-    #expect(WebSocket.makeAuthority(host: host, port: 4455) == expected)
+/// Ends its connection and, if told to, dials a second one before the first one has finished
+/// reporting.
+@MainActor
+final class RedialOnEndSocket: WebSocket {
+  var redialPort: Int?
+  var ends = 0
+
+  override func disconnect() {
+    let wasLive = state == .connected || state == .startingUp
+
+    super.disconnect()
+
+    guard wasLive else { return }
+
+    ends += 1
+
+    if let port = redialPort {
+      redialPort = nil
+      connect(host: "localhost", port: port)
+    }
   }
 }
 

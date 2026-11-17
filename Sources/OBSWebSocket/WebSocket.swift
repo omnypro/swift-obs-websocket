@@ -25,30 +25,32 @@ public class WebSocket {
 
   public init() {}
 
-  /// The `host:port` pair for a host the user typed, or `nil` when the host is empty.
-  nonisolated static func makeAuthority(host: String, port: Int) -> String? {
+  /// The WebSocket URL for a host the user typed, or `nil` when the host and port do not form
+  /// a URL that names exactly that host and port.
+  nonisolated static func makeURL(host: String, port: Int) -> URL? {
+    guard (1...65535).contains(port) else { return nil }
+
     let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
 
     guard !trimmed.isEmpty else { return nil }
 
     let isBareIPv6 = trimmed.contains(":") && !trimmed.hasPrefix("[")
 
-    return "\(isBareIPv6 ? "[\(trimmed)]" : trimmed):\(port)"
-  }
+    guard let url = URL(string: "ws://\(isBareIPv6 ? "[\(trimmed)]" : trimmed):\(port)"),
+      let parsedHost = url.host(), url.port == port, url.path.isEmpty,
+      url.user == nil, url.password == nil, url.query == nil, url.fragment == nil
+    else { return nil }
 
-  /// The WebSocket URL for a host the user typed, or `nil` when the host cannot form one.
-  nonisolated static func makeURL(host: String, port: Int) -> URL? {
-    guard let authority = makeAuthority(host: host, port: port) else { return nil }
+    // Text with a colon is a host only when it is an IPv6 address.
+    if parsedHost.contains(":"), IPv6Address(parsedHost) == nil { return nil }
 
-    return URL(string: "ws://\(authority)")
+    return url
   }
 
   public func connect(host: String = "localhost", port: Int = 4455) {
     disconnect()
 
-    guard let authority = WebSocket.makeAuthority(host: host, port: port),
-      let url = WebSocket.makeURL(host: host, port: port)
-    else {
+    guard let url = WebSocket.makeURL(host: host, port: port) else {
       state = .disconnected
       return
     }
@@ -56,10 +58,6 @@ public class WebSocket {
     let options = NWProtocolWebSocket.Options()
     options.autoReplyPing = true
     options.maximumMessageSize = WebSocket.maximumMessageSize
-
-    // Network.framework leaves the port out of the Host header. RFC 6455 wants it for a
-    // port other than 80, and a proxy in front of OBS can route on it.
-    options.setAdditionalHeaders([(name: "Host", value: authority)])
 
     let parameters = NWParameters.tcp
     parameters.defaultProtocolStack.applicationProtocols.insert(options, at: 0)
@@ -160,6 +158,9 @@ public class WebSocket {
       content: nil,
       contentContext: NWConnection.ContentContext(identifier: "close", metadata: [metadata]),
       isComplete: true, completion: .contentProcessed { _ in connection.cancel() })
+
+    // A peer that has stopped reading never completes the send, so cancel after a moment.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { connection.cancel() }
   }
 
   private func connectionStateChanged(_ newState: NWConnection.State, of connection: NWConnection) {
