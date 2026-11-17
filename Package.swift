@@ -1,12 +1,13 @@
-// swift-tools-version: 5.9
-// The swift-tools-version declares the minimum version of Swift required to build this package.
+// swift-tools-version: 6.0
 
 import PackageDescription
 
+// 14 and 17 are the first releases with Observation, which the WebSocket
+// classes use so SwiftUI can follow their state.
 let package = Package(
   name: "swift-obs-websocket",
   platforms: [
-    .macOS(.v10_15), .iOS(.v13), .tvOS(.v13),
+    .macOS(.v14), .iOS(.v17), .tvOS(.v17),
   ],
   products: [
     .library(
@@ -14,16 +15,8 @@ let package = Package(
       targets: ["OBSWebSocket"]
     )
   ],
-  dependencies: [
-    .package(url: "https://github.com/apple/swift-crypto.git", from: "3.1.0")
-  ],
   targets: [
-    .target(
-      name: "OBSWebSocket",
-      dependencies: [
-        .product(name: "Crypto", package: "swift-crypto")
-      ]
-    ),
+    .target(name: "OBSWebSocket"),
     .testTarget(
       name: "OBSWebSocketTests",
       dependencies: [

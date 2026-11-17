@@ -1,6 +1,7 @@
-public enum WebSocketState {
-  case None
-  case StartingUp
-  case Connected
-  case Disconnected
+public enum WebSocketState: Sendable {
+  /// No connection has been attempted yet.
+  case idle
+  case startingUp
+  case connected
+  case disconnected
 }

@@ -1,215 +1,186 @@
-import Crypto
+import CryptoKit
 import Foundation
+import OSLog
+import Observation
 
-public final class OpCode {
-  public static var Identify: Int = 1
-  public static var Request: Int = 6
+private let logger = Logger(subsystem: "pro.omny.OBSWebSocket", category: "OBSWebSocket")
+
+public enum OpCode {
+  public static let identify = 1
+  public static let request = 6
 }
 
-public final class RequestType {
-  public static var GetCurrentProgramScene: String = "GetCurrentProgramScene"
-  public static var GetSceneList: String = "GetSceneList"
-  public static var GetVersion: String = "GetVersion"
-  public static var SetCurrentProgramScene: String = "SetCurrentProgramScene"
-  public static var SetSceneSceneTransitionOverride: String = "SetSceneSceneTransitionOverride"
+public enum RequestType {
+  public static let getCurrentProgramScene = "GetCurrentProgramScene"
+  public static let getSceneList = "GetSceneList"
+  public static let getVersion = "GetVersion"
+  public static let setCurrentProgramScene = "SetCurrentProgramScene"
+  public static let setSceneSceneTransitionOverride = "SetSceneSceneTransitionOverride"
 }
 
-public final class EventType {
-  public static var CurrentProgramSceneChanged: String = "CurrentProgramSceneChanged"
+public enum EventType {
+  public static let currentProgramSceneChanged = "CurrentProgramSceneChanged"
 }
 
-@available(macOS 10.15, *)
+@MainActor @Observable
 public class OBSWebSocket: WebSocket {
-  @Published public var rpcVersion: Int = 0
+  public var rpcVersion: Int = 0
 
-  @Published public var versionMajor: Int = 0
-  @Published public var versionMinor: Int = 0
-  @Published public var versionPatch: Int = 0
+  public var versionMajor: Int = 0
+  public var versionMinor: Int = 0
+  public var versionPatch: Int = 0
 
-  @Published public var obsWebSocketVersion: String = ""
+  public var obsWebSocketVersion: String = ""
 
-  @Published public var authenticationSalt: String = ""
-  @Published public var authenticationChallenge: String = ""
+  public var authenticationSalt: String = ""
+  public var authenticationChallenge: String = ""
 
-  @Published public var sceneList: [String] = []
-
-  private var requestId: Int = 0
-
-  public var authenticationPassword: String = ""
+  public var sceneList: [String] = []
 
   public var currentSceneName: String = ""
 
-  private var isReadyForRequests: Bool = false
+  @ObservationIgnored public var authenticationPassword: String = ""
 
-  private var notReadyForRequestsMessage: String = "OBS WebSocket is not ready to receive requests."
+  @ObservationIgnored private var requestId: Int = 0
+
+  @ObservationIgnored private var isReadyForRequests: Bool = false
+
+  private static let notReadyForRequestsMessage = "OBS WebSocket is not ready to receive requests."
 
   override public func handleMessage(_ message: String) {
     do {
-      let data = message.data(using: .utf8)
+      let json =
+        try JSONSerialization.jsonObject(with: Data(message.utf8), options: []) as AnyObject?
 
-      let json = try JSONSerialization.jsonObject(with: data!, options: []) as AnyObject?
+      guard let d = json?["d"] as? [String: AnyObject] else { return }
 
-      if let d = json?["d"] as? [String: AnyObject] {
-        if d["requestType"] as? String == RequestType.GetSceneList {
-          DispatchQueue.main.async { [self] in
-            OBSWebSocket.parseGetSceneListResponse(
-              d, sceneList: &sceneList, currentSceneName: &currentSceneName)
-          }
-        } else if d["eventType"] as? String == EventType.CurrentProgramSceneChanged {
-          DispatchQueue.main.async { [self] in
-            OBSWebSocket.parseCurrentProgramSceneChanged(d, currentSceneName: &currentSceneName)
-          }
-        }
+      if d["requestType"] as? String == RequestType.getSceneList {
+        OBSWebSocket.parseGetSceneListResponse(
+          d, sceneList: &sceneList, currentSceneName: &currentSceneName)
+      } else if d["eventType"] as? String == EventType.currentProgramSceneChanged {
+        OBSWebSocket.parseCurrentProgramSceneChanged(d, currentSceneName: &currentSceneName)
+      }
 
-        if let rpcVersion = d["rpcVersion"] as? Int {
-          DispatchQueue.main.async { [self] in
-            self.rpcVersion = rpcVersion
-          }
+      if let rpcVersion = d["rpcVersion"] as? Int {
+        self.rpcVersion = rpcVersion
 
-          if d["authentication"] is [String: String] {
-            DispatchQueue.main.async { [self] in
-              OBSWebSocket.parseAuthentication(
-                d, authenticationChallenge: &authenticationChallenge,
-                authenticationSalt: &authenticationSalt)
+        if d["authentication"] is [String: String] {
+          OBSWebSocket.parseAuthentication(
+            d, authenticationChallenge: &authenticationChallenge,
+            authenticationSalt: &authenticationSalt)
 
-              if !authenticationChallenge.isEmpty && !authenticationSalt.isEmpty {
-                let authentication = OBSWebSocket.generateAuthenticationString(
-                  password: authenticationPassword, salt: authenticationSalt,
-                  challenge: authenticationChallenge)
+          if !authenticationChallenge.isEmpty && !authenticationSalt.isEmpty {
+            let authentication = OBSWebSocket.generateAuthenticationString(
+              password: authenticationPassword, salt: authenticationSalt,
+              challenge: authenticationChallenge)
 
-                sendDictionary([
-                  "op": OpCode.Identify,
-                  "d": [
-                    "rpcVersion": rpcVersion,
-                    "authentication": authentication,
-                  ],
-                ])
-              }
-            }
-          } else {
             sendDictionary([
-              "op": OpCode.Identify,
+              "op": OpCode.identify,
               "d": [
-                "rpcVersion": rpcVersion
+                "rpcVersion": rpcVersion,
+                "authentication": authentication,
               ],
             ])
           }
-
-          if d["obsWebSocketVersion"] is String {
-            DispatchQueue.main.async { [self] in
-              OBSWebSocket.parseVersion(
-                d, versionMajor: &versionMajor, versionMinor: &versionMinor,
-                versionPatch: &versionPatch)
-
-              obsWebSocketVersion = "\(versionMajor).\(versionMinor).\(versionPatch)"
-            }
-          }
-
-        } else if let negotiatedRpcVersion = d["negotiatedRpcVersion"] as? Int {
-          if negotiatedRpcVersion != rpcVersion {
-            disconnect()
-
-            return
-          }
-
-          isReadyForRequests = true
-
-          requestGetVersion()
-
-          requestGetSceneList()
+        } else {
+          sendDictionary([
+            "op": OpCode.identify,
+            "d": [
+              "rpcVersion": rpcVersion
+            ],
+          ])
         }
+
+        if d["obsWebSocketVersion"] is String {
+          OBSWebSocket.parseVersion(
+            d, versionMajor: &versionMajor, versionMinor: &versionMinor,
+            versionPatch: &versionPatch)
+
+          obsWebSocketVersion = "\(versionMajor).\(versionMinor).\(versionPatch)"
+        }
+      } else if let negotiatedRpcVersion = d["negotiatedRpcVersion"] as? Int {
+        if negotiatedRpcVersion != rpcVersion {
+          disconnect()
+
+          return
+        }
+
+        isReadyForRequests = true
+
+        requestGetVersion()
+
+        requestGetSceneList()
       }
     } catch {
-      print(error.localizedDescription)
+      logger.error("Reading a message failed: \(error.localizedDescription, privacy: .public)")
     }
   }
 
-  public static func parseAuthentication(
+  public nonisolated static func parseAuthentication(
     _ d: [String: AnyObject], authenticationChallenge: inout String,
     authenticationSalt: inout String
   ) {
     if let authentication = d["authentication"],
-      let _authenticationChallenge = authentication["challenge"] as? String,
-      let _authenticationSalt = authentication["salt"] as? String
+      let challenge = authentication["challenge"] as? String,
+      let salt = authentication["salt"] as? String
     {
-      authenticationChallenge = _authenticationChallenge
-      authenticationSalt = _authenticationSalt
+      authenticationChallenge = challenge
+      authenticationSalt = salt
     }
   }
 
-  public static func parseCurrentProgramSceneChanged(
+  public nonisolated static func parseCurrentProgramSceneChanged(
     _ d: [String: AnyObject], currentSceneName: inout String
   ) {
     if let eventData = d["eventData"],
-      let _currentSceneName = eventData["sceneName"] as? String
+      let sceneName = eventData["sceneName"] as? String
     {
-      currentSceneName = _currentSceneName
+      currentSceneName = sceneName
     }
   }
 
-  public static func parseGetSceneListResponse(
+  public nonisolated static func parseGetSceneListResponse(
     _ d: [String: AnyObject], sceneList: inout [String], currentSceneName: inout String
   ) {
     if let responseData = d["responseData"],
-      let _currentSceneName = responseData["currentProgramSceneName"] as? String,
+      let sceneName = responseData["currentProgramSceneName"] as? String,
       let scenes = responseData["scenes"] as? [AnyObject]
     {
-      currentSceneName = _currentSceneName
+      currentSceneName = sceneName
 
-      if scenes.count > 0 {
-        sceneList.removeAll()
-
-        for i in 0..<scenes.count {
-          if let sceneName = scenes[i]["sceneName"] {
-            sceneList.append(sceneName as! String)
-          }
-        }
+      if !scenes.isEmpty {
+        sceneList = scenes.compactMap { ($0 as? [String: Any])?["sceneName"] as? String }
       }
     }
   }
 
-  public static func parseVersion(
+  public nonisolated static func parseVersion(
     _ d: [String: AnyObject], versionMajor: inout Int, versionMinor: inout Int,
     versionPatch: inout Int
   ) {
-    if let obsWebSocketVersion = d["obsWebSocketVersion"] as? String {
-      do {
-        let regex = try NSRegularExpression(
-          pattern: "^(?:(\\d+))(?:\\.(\\d+))?(?:\\.(\\d+))?")
+    guard let version = d["obsWebSocketVersion"] as? String else { return }
 
-        let nsrange = NSRange(
-          obsWebSocketVersion.startIndex..<obsWebSocketVersion.endIndex,
-          in: obsWebSocketVersion
-        )
+    let parts = version.split(separator: ".", maxSplits: 2, omittingEmptySubsequences: false)
+      .map { Int($0.prefix(while: { $0.isASCII && $0.isNumber })) }
 
-        if let match = regex.firstMatch(in: obsWebSocketVersion, range: nsrange) {
-          versionMajor = Int(
-            (obsWebSocketVersion as NSString).substring(with: match.range(at: 1)))!
-          versionMinor = Int(
-            (obsWebSocketVersion as NSString).substring(with: match.range(at: 2)))!
-          versionPatch = Int(
-            (obsWebSocketVersion as NSString).substring(with: match.range(at: 3)))!
-        }
-      } catch {
-        print(error.localizedDescription)
-      }
-    }
+    guard let major = parts.first.flatMap({ $0 }) else { return }
+
+    versionMajor = major
+    versionMinor = parts.count > 1 ? (parts[1] ?? 0) : 0
+    versionPatch = parts.count > 2 ? (parts[2] ?? 0) : 0
   }
 
-  public static func generateAuthenticationString(password: String, salt: String, challenge: String)
-    -> String
-  {
-    let base64_secret = Data(SHA256.hash(data: (password + salt).data(using: .utf8)!))
-      .base64EncodedString()
-    let authentication = Data(SHA256.hash(data: (base64_secret + challenge).data(using: .utf8)!))
-      .base64EncodedString()
+  public nonisolated static func generateAuthenticationString(
+    password: String, salt: String, challenge: String
+  ) -> String {
+    let secret = Data(SHA256.hash(data: Data((password + salt).utf8))).base64EncodedString()
 
-    return authentication
+    return Data(SHA256.hash(data: Data((secret + challenge).utf8))).base64EncodedString()
   }
 
   public func requestGetVersion() {
     if !isReadyForRequests {
-      print(notReadyForRequestsMessage)
+      logger.debug("\(OBSWebSocket.notReadyForRequestsMessage)")
 
       return
     }
@@ -217,17 +188,17 @@ public class OBSWebSocket: WebSocket {
     requestId += 1
 
     sendDictionary([
-      "op": OpCode.Request,
+      "op": OpCode.request,
       "d": [
         "requestId": String(requestId),
-        "requestType": RequestType.GetVersion,
+        "requestType": RequestType.getVersion,
       ],
     ])
   }
 
   public func requestGetSceneList() {
     if !isReadyForRequests {
-      print(notReadyForRequestsMessage)
+      logger.debug("\(OBSWebSocket.notReadyForRequestsMessage)")
 
       return
     }
@@ -235,17 +206,17 @@ public class OBSWebSocket: WebSocket {
     requestId += 1
 
     sendDictionary([
-      "op": OpCode.Request,
+      "op": OpCode.request,
       "d": [
         "requestId": String(requestId),
-        "requestType": RequestType.GetSceneList,
+        "requestType": RequestType.getSceneList,
       ],
     ])
   }
 
   public func requestGetCurrentScene() {
     if !isReadyForRequests {
-      print(notReadyForRequestsMessage)
+      logger.debug("\(OBSWebSocket.notReadyForRequestsMessage)")
 
       return
     }
@@ -253,10 +224,10 @@ public class OBSWebSocket: WebSocket {
     requestId += 1
 
     sendDictionary([
-      "op": OpCode.Request,
+      "op": OpCode.request,
       "d": [
         "requestId": String(requestId),
-        "requestType": RequestType.GetCurrentProgramScene,
+        "requestType": RequestType.getCurrentProgramScene,
       ],
     ])
   }
@@ -264,7 +235,7 @@ public class OBSWebSocket: WebSocket {
   public func requestSetSceneTransitionOverride(_ sceneName: String, transitionName: String = "Cut")
   {
     if !isReadyForRequests {
-      print(notReadyForRequestsMessage)
+      logger.debug("\(OBSWebSocket.notReadyForRequestsMessage)")
 
       return
     }
@@ -276,10 +247,10 @@ public class OBSWebSocket: WebSocket {
     requestId += 1
 
     sendDictionary([
-      "op": OpCode.Request,
+      "op": OpCode.request,
       "d": [
         "requestId": String(requestId),
-        "requestType": RequestType.SetSceneSceneTransitionOverride,
+        "requestType": RequestType.setSceneSceneTransitionOverride,
         "requestData": [
           "sceneName": sceneName,
           "transitionName": transitionName,
@@ -290,7 +261,7 @@ public class OBSWebSocket: WebSocket {
 
   public func requestSetCurrentScene(_ sceneName: String) {
     if !isReadyForRequests {
-      print(notReadyForRequestsMessage)
+      logger.debug("\(OBSWebSocket.notReadyForRequestsMessage)")
 
       return
     }
@@ -302,10 +273,10 @@ public class OBSWebSocket: WebSocket {
     requestId += 1
 
     sendDictionary([
-      "op": OpCode.Request,
+      "op": OpCode.request,
       "d": [
         "requestId": String(requestId),
-        "requestType": RequestType.SetCurrentProgramScene,
+        "requestType": RequestType.setCurrentProgramScene,
         "requestData": [
           "sceneName": sceneName
         ],

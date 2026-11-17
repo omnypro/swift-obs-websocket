@@ -13,14 +13,28 @@ struct WebSocketTimeoutTests {
 
     socket.connect(host: "localhost", port: Int(server.port.rawValue))
 
-    #expect(await socket.becomes(.Disconnected, within: 3))
+    #expect(await socket.becomes(.disconnected, within: 3))
+
+    server.stop()
+  }
+
+  @Test func aSupersededConnectionFailureLeavesTheNewConnectionAlone() async throws {
+    let server = try await SilentServer.start()
+    let socket = WebSocket()
+    socket.connectionTimeout = 30
+
+    socket.connect(host: "localhost", port: 1)
+    socket.connect(host: "localhost", port: Int(server.port.rawValue))
+    try await Task.sleep(for: .milliseconds(500))
+
+    #expect(socket.state == .startingUp)
 
     server.stop()
   }
 }
 
 /// Accepts TCP connections and never writes, so the WebSocket handshake cannot finish.
-private final class SilentServer: @unchecked Sendable {
+final class SilentServer: @unchecked Sendable {
   let port: NWEndpoint.Port
 
   private let listener: NWListener

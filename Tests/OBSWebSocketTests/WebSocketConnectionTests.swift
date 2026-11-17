@@ -10,7 +10,7 @@ struct WebSocketConnectionTests {
 
     socket.connect(host: "bad host", port: 4455)
 
-    #expect(socket.state == .Disconnected)
+    #expect(socket.state == .disconnected)
   }
 
   @Test func aRefusedConnectionEndsDisconnected() async {
@@ -18,7 +18,7 @@ struct WebSocketConnectionTests {
 
     socket.connect(host: "localhost", port: 1)
 
-    #expect(await socket.becomes(.Disconnected, within: 2))
+    #expect(await socket.becomes(.disconnected, within: 2))
   }
 }
 
