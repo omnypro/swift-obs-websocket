@@ -4,9 +4,11 @@ build:
 test:
 	swift test
 
+lint:
+	swift format lint --strict --recursive Sources Tests Package.swift
+
 format:
-	swift-format -i Sources/**/*.swift
-	swift-format -i Tests/**/*.swift
+	swift format --in-place --recursive Sources Tests Package.swift
 
 clean:
 	rm -rf .build
