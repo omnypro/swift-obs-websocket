@@ -1,10 +1,15 @@
 import Foundation
+import Network
 import OSLog
 import Observation
 
 private let logger = Logger(subsystem: "pro.omny.OBSWebSocket", category: "WebSocket")
 
 /// A WebSocket client whose state SwiftUI can observe.
+///
+/// The connection uses Network.framework. URLSession would hold a `ws://` connection to
+/// App Transport Security, which blocks fully qualified host names that have no TLS.
+/// OBS speaks plain `ws://`, so that block would stop a Mac from reaching OBS by name.
 @MainActor @Observable
 public class WebSocket {
   public var state: WebSocketState = .idle
@@ -12,21 +17,34 @@ public class WebSocket {
   /// How long a connection may stay in `.startingUp` before it is given up.
   public var connectionTimeout: TimeInterval = 5
 
-  @ObservationIgnored private var session: URLSession?
-  @ObservationIgnored private var webSocketTask: URLSessionWebSocketTask?
+  /// The largest message the socket accepts, in bytes. OBS messages are far smaller.
+  nonisolated static let maximumMessageSize = 8 * 1024 * 1024
+
+  @ObservationIgnored private var connection: NWConnection?
   @ObservationIgnored private var timeoutTask: Task<Void, Never>?
 
   public init() {}
 
-  /// The WebSocket URL for a host the user typed, or `nil` when the host cannot form one.
+  /// The WebSocket URL for a host the user typed, or `nil` when the host and port do not form
+  /// a URL that names exactly that host and port.
   nonisolated static func makeURL(host: String, port: Int) -> URL? {
+    guard (1...65535).contains(port) else { return nil }
+
     let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
 
     guard !trimmed.isEmpty else { return nil }
 
     let isBareIPv6 = trimmed.contains(":") && !trimmed.hasPrefix("[")
 
-    return URL(string: "ws://\(isBareIPv6 ? "[\(trimmed)]" : trimmed):\(port)")
+    guard let url = URL(string: "ws://\(isBareIPv6 ? "[\(trimmed)]" : trimmed):\(port)"),
+      let parsedHost = url.host(), url.port == port, url.path.isEmpty,
+      url.user == nil, url.password == nil, url.query == nil, url.fragment == nil
+    else { return nil }
+
+    // Text with a colon is a host only when it is an IPv6 address.
+    if parsedHost.contains(":"), IPv6Address(parsedHost) == nil { return nil }
+
+    return url
   }
 
   public func connect(host: String = "localhost", port: Int = 4455) {
@@ -37,24 +55,36 @@ public class WebSocket {
       return
     }
 
-    let session = URLSession(
-      configuration: .default, delegate: SessionDelegate(socket: self), delegateQueue: nil)
-    let task = session.webSocketTask(with: url)
+    let options = NWProtocolWebSocket.Options()
+    options.autoReplyPing = true
+    options.maximumMessageSize = WebSocket.maximumMessageSize
 
-    self.session = session
-    webSocketTask = task
+    let parameters = NWParameters.tcp
+    parameters.defaultProtocolStack.applicationProtocols.insert(options, at: 0)
+
+    let connection = NWConnection(to: .url(url), using: parameters)
+
+    self.connection = connection
     state = .startingUp
 
-    task.resume()
+    // The main queue delivers every callback in order, so a message cannot overtake the
+    // `.ready` that comes before it.
+    connection.stateUpdateHandler = { [weak self, weak connection] newState in
+      MainActor.assumeIsolated {
+        guard let self, let connection else { return }
 
-    receiveMessage(from: task)
+        self.connectionStateChanged(newState, of: connection)
+      }
+    }
+
+    connection.start(queue: .main)
 
     timeoutTask = Task { [weak self, connectionTimeout] in
       try? await Task.sleep(for: .seconds(connectionTimeout))
 
       guard !Task.isCancelled else { return }
 
-      self?.connectionTimedOut(task)
+      self?.connectionTimedOut(connection)
     }
   }
 
@@ -63,13 +93,18 @@ public class WebSocket {
   }
 
   public func sendMessage(_ message: String) {
-    guard let task = webSocketTask, task.state == .running else { return }
+    guard let connection, connection.state == .ready else { return }
 
-    task.send(.string(message)) { error in
-      if let error {
-        logger.error("Sending failed: \(error.localizedDescription, privacy: .public)")
-      }
-    }
+    let context = NWConnection.ContentContext(
+      identifier: "text", metadata: [NWProtocolWebSocket.Metadata(opcode: .text)])
+
+    connection.send(
+      content: Data(message.utf8), contentContext: context, isComplete: true,
+      completion: .contentProcessed { error in
+        if let error {
+          logger.error("Sending failed: \(error.localizedDescription, privacy: .public)")
+        }
+      })
   }
 
   public func sendDictionary(_ dict: Any) {
@@ -92,110 +127,114 @@ public class WebSocket {
     timeoutTask?.cancel()
     timeoutTask = nil
 
-    webSocketTask?.cancel(with: .normalClosure, reason: nil)
-    webSocketTask = nil
-
-    session?.finishTasksAndInvalidate()
-    session = nil
+    if let connection {
+      self.connection = nil
+      WebSocket.close(connection)
+    }
   }
 
   isolated deinit {
     timeoutTask?.cancel()
-    webSocketTask?.cancel(with: .goingAway, reason: nil)
-    session?.finishTasksAndInvalidate()
+
+    if let connection {
+      WebSocket.close(connection)
+    }
   }
 
-  private func receiveMessage(from task: URLSessionWebSocketTask) {
-    task.receive { [weak self] result in
-      Task { @MainActor in
-        self?.received(result, from: task)
+  /// Ends a connection the socket no longer tracks. A connection that finished its
+  /// handshake gets a close frame first.
+  private static func close(_ connection: NWConnection) {
+    connection.stateUpdateHandler = nil
+
+    guard connection.state == .ready else {
+      connection.cancel()
+      return
+    }
+
+    let metadata = NWProtocolWebSocket.Metadata(opcode: .close)
+    metadata.closeCode = .protocolCode(.normalClosure)
+
+    connection.send(
+      content: nil,
+      contentContext: NWConnection.ContentContext(identifier: "close", metadata: [metadata]),
+      isComplete: true, completion: .contentProcessed { _ in connection.cancel() })
+
+    // A peer that has stopped reading never completes the send, so cancel after a moment.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { connection.cancel() }
+  }
+
+  private func connectionStateChanged(_ newState: NWConnection.State, of connection: NWConnection) {
+    guard connection === self.connection else { return }
+
+    switch newState {
+    case .ready:
+      state = .connected
+
+      timeoutTask?.cancel()
+
+      receiveMessage(from: connection)
+
+    case .waiting(let error), .failed(let error):
+      // `.waiting` is where a refused connection or a failed lookup lands, and the
+      // connection would retry it for as long as it lives.
+      logger.error("Connecting failed: \(error.localizedDescription, privacy: .public)")
+
+      disconnect()
+
+    case .cancelled:
+      disconnect()
+
+    default:
+      break
+    }
+  }
+
+  private func receiveMessage(from connection: NWConnection) {
+    connection.receiveMessage { [weak self, weak connection] data, context, _, error in
+      MainActor.assumeIsolated {
+        guard let self, let connection else { return }
+
+        self.received(data, context: context, error: error, from: connection)
       }
     }
   }
 
   private func received(
-    _ result: Result<URLSessionWebSocketTask.Message, Error>, from task: URLSessionWebSocketTask
+    _ data: Data?, context: NWConnection.ContentContext?, error: NWError?,
+    from connection: NWConnection
   ) {
-    guard task === webSocketTask else { return }
+    guard connection === self.connection else { return }
 
-    switch result {
-    case .success(let message):
-      if case .string(let text) = message {
+    if let error {
+      logger.error("Receiving failed: \(error.localizedDescription, privacy: .public)")
+
+      disconnect()
+      return
+    }
+
+    let metadata =
+      context?.protocolMetadata(definition: NWProtocolWebSocket.definition)
+      as? NWProtocolWebSocket.Metadata
+
+    switch metadata?.opcode {
+    case .close:
+      disconnect()
+
+    case .text:
+      if let data, let text = String(data: data, encoding: .utf8) {
         handleMessage(text)
       }
 
-      if task.state == .running {
-        receiveMessage(from: task)
-      }
+      receiveMessage(from: connection)
 
-    case .failure(let error):
-      logger.error("Receiving failed: \(error.localizedDescription, privacy: .public)")
+    default:
+      receiveMessage(from: connection)
     }
   }
 
-  private func connectionTimedOut(_ task: URLSessionWebSocketTask) {
-    guard task === webSocketTask, state == .startingUp else { return }
+  private func connectionTimedOut(_ connection: NWConnection) {
+    guard connection === self.connection, state == .startingUp else { return }
 
     disconnect()
-  }
-
-  fileprivate func connectionOpened(_ task: URLSessionTask) {
-    guard task === webSocketTask else { return }
-
-    state = .connected
-
-    timeoutTask?.cancel()
-  }
-
-  fileprivate func connectionEnded(_ task: URLSessionTask) {
-    guard task === webSocketTask else { return }
-
-    disconnect()
-  }
-}
-
-/// Reports what URLSession says about one connection back to the socket on the main actor.
-///
-/// Every callback names the task it came from. The socket ignores a task it has already
-/// replaced, so a late failure from an old connection cannot end the new one.
-private final class SessionDelegate: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
-  private weak var socket: WebSocket?
-
-  init(socket: WebSocket) {
-    self.socket = socket
-  }
-
-  func urlSession(
-    _ session: URLSession, webSocketTask: URLSessionWebSocketTask,
-    didOpenWithProtocol protocol: String?
-  ) {
-    let socket = socket
-
-    Task { @MainActor in
-      socket?.connectionOpened(webSocketTask)
-    }
-  }
-
-  func urlSession(
-    _ session: URLSession, webSocketTask: URLSessionWebSocketTask,
-    didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?
-  ) {
-    let socket = socket
-
-    Task { @MainActor in
-      socket?.connectionEnded(webSocketTask)
-    }
-  }
-
-  func urlSession(
-    _ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?
-  ) {
-    guard error != nil else { return }
-
-    let socket = socket
-
-    Task { @MainActor in
-      socket?.connectionEnded(task)
-    }
   }
 }
