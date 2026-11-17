@@ -6,17 +6,34 @@ public class WebSocket: NSObject, IWebSocket, ObservableObject, URLSessionWebSoc
 
   internal var webSocketTask: URLSessionWebSocketTask?
 
-  private let timeoutInSeconds: Double = 5
+  /// How long a connection may stay in `.StartingUp` before it is given up.
+  public var connectionTimeout: TimeInterval = 5
 
   private var timeoutDispatch: DispatchWorkItem?
+
+  /// The WebSocket URL for a host the user typed, or `nil` when the host cannot form one.
+  static func makeURL(host: String, port: Int) -> URL? {
+    let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    guard !trimmed.isEmpty else { return nil }
+
+    let isBareIPv6 = trimmed.contains(":") && !trimmed.hasPrefix("[")
+
+    return URL(string: "ws://\(isBareIPv6 ? "[\(trimmed)]" : trimmed):\(port)")
+  }
 
   public func connect(host: String = "localhost", port: Int = 4455) {
     disconnect()
 
+    guard let url = WebSocket.makeURL(host: host, port: port) else {
+      state = .Disconnected
+      return
+    }
+
     let session = URLSession(
       configuration: .default, delegate: self, delegateQueue: OperationQueue())
 
-    webSocketTask = session.webSocketTask(with: URL(string: "ws://\(host):\(port)")!)
+    webSocketTask = session.webSocketTask(with: url)
 
     state = .StartingUp
 
@@ -24,15 +41,15 @@ public class WebSocket: NSObject, IWebSocket, ObservableObject, URLSessionWebSoc
 
     receiveMessage()
 
-    timeoutDispatch = DispatchWorkItem { [weak self] in
-      if self?.webSocketTask?.state != URLSessionTask.State.running {
+    let timeout = DispatchWorkItem { [weak self] in
+      if self?.state == .StartingUp {
         self?.disconnect()
       }
     }
 
-    DispatchQueue.global().asyncAfter(
-      deadline: .now() + timeoutInSeconds,
-      execute: timeoutDispatch!)
+    timeoutDispatch = timeout
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + connectionTimeout, execute: timeout)
   }
 
   public func receiveMessage() {
@@ -107,7 +124,7 @@ public class WebSocket: NSObject, IWebSocket, ObservableObject, URLSessionWebSoc
   }
 
   public func urlSession(
-    _ session: URLSession, webSocketTask: URLSessionTask,
+    _ session: URLSession, task: URLSessionTask,
     didCompleteWithError error: Error?
   ) {
     if error != nil {
@@ -118,9 +135,7 @@ public class WebSocket: NSObject, IWebSocket, ObservableObject, URLSessionWebSoc
   }
 
   public func disconnect() {
-    if self.state != .Connected {
-      return
-    }
+    guard state == .Connected || state == .StartingUp else { return }
 
     self.state = .Disconnected
 
