@@ -216,3 +216,64 @@ final class RequestRecorder: @unchecked Sendable {
     }
   }
 }
+
+/// A TCP server that hands each accepted connection to a closure, for peers that are not OBS.
+final class RawServer: @unchecked Sendable {
+  private let listener: NWListener
+  private let lock = NSLock()
+  private var connections: [NWConnection] = []
+  private var port: NWEndpoint.Port = .any
+
+  var portNumber: Int { lock.withLock { Int(port.rawValue) } }
+
+  private init(listener: NWListener) {
+    self.listener = listener
+  }
+
+  static func start(
+    onAccept: @escaping @Sendable (NWConnection) -> Void
+  ) async throws -> RawServer {
+    let listener = try NWListener(using: .tcp, on: .any)
+    let server = RawServer(listener: listener)
+
+    listener.newConnectionHandler = { [weak server] connection in
+      server?.lock.withLock { server?.connections.append(connection) }
+      connection.start(queue: .global())
+      onAccept(connection)
+    }
+
+    let port: NWEndpoint.Port = try await withCheckedThrowingContinuation { continuation in
+      listener.stateUpdateHandler = { state in
+        switch state {
+        case .ready:
+          listener.stateUpdateHandler = nil
+
+          if let port = listener.port {
+            continuation.resume(returning: port)
+          } else {
+            continuation.resume(throwing: NWError.posix(.EINVAL))
+          }
+
+        case .failed(let error):
+          listener.stateUpdateHandler = nil
+          continuation.resume(throwing: error)
+
+        default:
+          break
+        }
+      }
+      listener.start(queue: .global())
+    }
+
+    server.lock.withLock { server.port = port }
+
+    return server
+  }
+
+  func stop() {
+    listener.cancel()
+    for connection in lock.withLock({ connections }) {
+      connection.cancel()
+    }
+  }
+}

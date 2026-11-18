@@ -16,8 +16,13 @@ struct ConnectionFailureMappingTests {
     NetworkCase(error: .posix(.EHOSTUNREACH), failure: .timedOut),
     NetworkCase(error: .posix(.ENETUNREACH), failure: .timedOut),
     NetworkCase(error: .posix(.EHOSTDOWN), failure: .timedOut),
-    NetworkCase(error: .posix(.ECONNRESET), failure: .connectionLost),
-    NetworkCase(error: .posix(.EPIPE), failure: .connectionLost),
+    // Before the socket opens, a reset or any other error means the peer is not OBS.
+    NetworkCase(error: .posix(.ECONNRESET), failure: .refused),
+    NetworkCase(error: .posix(.EPIPE), failure: .refused),
+    NetworkCase(error: .posix(.ECONNABORTED), failure: .refused),
+    NetworkCase(error: .posix(.EPROTO), failure: .refused),
+    NetworkCase(error: .posix(.ENOTCONN), failure: .refused),
+    NetworkCase(error: .tls(-9806), failure: .refused),
     // kDNSServiceErr_NoSuchRecord and kDNSServiceErr_NoSuchName
     NetworkCase(error: .dns(-65554), failure: .hostNotFound),
     NetworkCase(error: .dns(-65538), failure: .hostNotFound),
@@ -451,5 +456,48 @@ struct ConnectionFailureTests {
 
     #expect(await socket.becomes(.disconnected, within: 2))
     #expect(socket.failure == .connectionLost)
+  }
+
+  // MARK: - A peer that is not OBS
+
+  /// Port 445 on a Mac with file sharing accepts the connection and resets it.
+  @Test func aServerThatClosesAtOnceIsNotAcceptingConnections() async throws {
+    let server = try await RawServer.start { $0.cancel() }
+    defer { server.stop() }
+    let socket = OBSWebSocket()
+
+    socket.connect(host: "localhost", port: server.portNumber)
+
+    #expect(await socket.becomes(.disconnected, within: 3))
+    #expect(socket.failure == .refused)
+  }
+
+  @Test func aServerThatAnswersAsPlainHTTPIsNotAcceptingConnections() async throws {
+    let server = try await RawServer.start { connection in
+      connection.send(
+        content: Data("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".utf8),
+        completion: .contentProcessed { _ in })
+    }
+    defer { server.stop() }
+    let socket = OBSWebSocket()
+
+    socket.connect(host: "localhost", port: server.portNumber)
+
+    #expect(await socket.becomes(.disconnected, within: 3))
+    #expect(socket.failure == .refused)
+  }
+
+  @Test func aConnectionCancelledBeforeItOpenedIsNotALostConnection() async throws {
+    let server = try await SilentServer.start()
+    defer { server.stop() }
+    let socket = WebSocket()
+    socket.connectionTimeout = 30
+
+    socket.connect(host: "localhost", port: Int(server.port.rawValue))
+    let connection = try #require(socket.connection)
+
+    socket.connectionStateChanged(.cancelled, of: connection)
+
+    #expect(socket.failure == .refused)
   }
 }
