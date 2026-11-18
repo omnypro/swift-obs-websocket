@@ -224,7 +224,7 @@ public class WebSocket {
       if state == .connected {
         failAfterGrace(.connectionLost, on: connection)
       } else {
-        fail(.connectionLost)
+        fail(.refused)
       }
 
     default:

@@ -31,6 +31,10 @@ public enum ConnectionFailure: Equatable, Sendable {
 
   /// The failure behind an error reported while the connection was opening.
   ///
+  /// No connection existed yet, so no case here means a lost one. A peer that resets the
+  /// connection, answers something other than a WebSocket handshake, or fails in a way this does
+  /// not name is not accepting a WebSocket connection.
+  ///
   /// For a TCP connection to a device on the local network, macOS reports a blocked local network
   /// on the connection's path and gives an ordinary POSIX error, so the path reason comes first.
   init(networkError: NWError, pathReason: NWPath.UnsatisfiedReason? = nil) {
@@ -50,14 +54,14 @@ public enum ConnectionFailure: Equatable, Sendable {
         self = .timedOut
 
       default:
-        self = .connectionLost
+        self = .refused
       }
 
     case .dns(let code):
       self = code == ConnectionFailure.dnsPolicyDenied ? .localNetworkDenied : .hostNotFound
 
     default:
-      self = .connectionLost
+      self = .refused
     }
   }
 
