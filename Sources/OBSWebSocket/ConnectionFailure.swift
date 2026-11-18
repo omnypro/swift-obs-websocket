@@ -30,7 +30,16 @@ public enum ConnectionFailure: Equatable, Sendable {
   private static let dnsPolicyDenied: Int32 = -65570
 
   /// The failure behind an error reported while the connection was opening.
-  init(networkError: NWError) {
+  ///
+  /// For a TCP connection to a device on the local network, macOS reports a blocked local network
+  /// on the connection's path and gives an ordinary POSIX error, so the path reason comes first.
+  init(networkError: NWError, pathReason: NWPath.UnsatisfiedReason? = nil) {
+    if pathReason == .localNetworkDenied {
+      self = .localNetworkDenied
+
+      return
+    }
+
     switch networkError {
     case .posix(let code):
       switch code {

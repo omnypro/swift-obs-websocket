@@ -78,6 +78,7 @@ public class OBSWebSocket: WebSocket {
   /// OBS sends `Hello` as soon as the socket opens. A server that stays silent is not OBS, or
   /// is not answering, so the wait is as long as the connection timeout.
   override func connectionDidOpen() {
+    // No `super`: an old failure stays until OBS accepts the login, so a client keeps showing it.
     identifyTask?.cancel()
 
     identifyTask = Task { [weak self, connectionTimeout] in

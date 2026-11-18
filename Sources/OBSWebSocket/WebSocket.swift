@@ -24,7 +24,7 @@ public class WebSocket {
   /// The largest message the socket accepts, in bytes. OBS messages are far smaller.
   nonisolated static let maximumMessageSize = 8 * 1024 * 1024
 
-  @ObservationIgnored private var connection: NWConnection?
+  @ObservationIgnored var connection: NWConnection?
   @ObservationIgnored private var timeoutTask: Task<Void, Never>?
 
   public init() {}
@@ -123,8 +123,12 @@ public class WebSocket {
     endConnection()
   }
 
-  /// Called when the socket opens. A subclass that has a handshake of its own starts it here.
-  func connectionDidOpen() {}
+  /// Called when the socket opens. A plain socket has nothing left to do, so an old failure ends
+  /// here. A subclass with a handshake of its own starts it instead and clears the failure when
+  /// the handshake succeeds.
+  func connectionDidOpen() {
+    failure = nil
+  }
 
   /// Called when a connection that was starting or open has ended, however it ended.
   func connectionDidEnd() {}
@@ -188,7 +192,7 @@ public class WebSocket {
     DispatchQueue.main.asyncAfter(deadline: .now() + 1) { connection.cancel() }
   }
 
-  private func connectionStateChanged(_ newState: NWConnection.State, of connection: NWConnection) {
+  func connectionStateChanged(_ newState: NWConnection.State, of connection: NWConnection) {
     guard connection === self.connection else { return }
 
     switch newState {
@@ -206,11 +210,22 @@ public class WebSocket {
       // connection would retry it for as long as it lives.
       logger.error("Connecting failed: \(error.localizedDescription, privacy: .public)")
 
-      // An error on a connection that was already open is a drop, whatever its code says.
-      fail(state == .connected ? .connectionLost : ConnectionFailure(networkError: error))
+      if state == .connected {
+        // An error on an open connection is a drop, but a close frame with a reason may still
+        // be on its way. The receive that holds it gets a moment to report first.
+        failAfterGrace(.connectionLost, on: connection)
+      } else {
+        fail(
+          ConnectionFailure(
+            networkError: error, pathReason: connection.currentPath?.unsatisfiedReason))
+      }
 
     case .cancelled:
-      fail(.connectionLost)
+      if state == .connected {
+        failAfterGrace(.connectionLost, on: connection)
+      } else {
+        fail(.connectionLost)
+      }
 
     default:
       break
@@ -227,11 +242,21 @@ public class WebSocket {
     }
   }
 
-  private func received(
+  func received(
     _ data: Data?, context: NWConnection.ContentContext?, error: NWError?,
     from connection: NWConnection
   ) {
     guard connection === self.connection else { return }
+
+    let metadata =
+      context?.protocolMetadata(definition: NWProtocolWebSocket.definition)
+      as? NWProtocolWebSocket.Metadata
+
+    // A close frame can arrive in the same completion as an error, and its code is the reason.
+    if metadata?.opcode == .close {
+      fail(ConnectionFailure(closeCode: WebSocket.code(of: metadata?.closeCode)))
+      return
+    }
 
     if let error {
       logger.error("Receiving failed: \(error.localizedDescription, privacy: .public)")
@@ -240,14 +265,7 @@ public class WebSocket {
       return
     }
 
-    let metadata =
-      context?.protocolMetadata(definition: NWProtocolWebSocket.definition)
-      as? NWProtocolWebSocket.Metadata
-
     switch metadata?.opcode {
-    case .close:
-      fail(ConnectionFailure(closeCode: WebSocket.code(of: metadata?.closeCode)))
-
     case .text:
       if let data, let text = String(data: data, encoding: .utf8) {
         handleMessage(text)
@@ -257,6 +275,18 @@ public class WebSocket {
 
     default:
       receiveMessage(from: connection)
+    }
+  }
+
+  /// Reports `reason` after a moment, unless a receive has already ended this connection with a
+  /// better one.
+  private func failAfterGrace(_ reason: ConnectionFailure, on connection: NWConnection) {
+    Task {
+      try? await Task.sleep(for: .milliseconds(100))
+
+      guard connection === self.connection else { return }
+
+      fail(reason)
     }
   }
 

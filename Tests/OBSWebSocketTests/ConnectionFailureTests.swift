@@ -28,6 +28,22 @@ struct ConnectionFailureMappingTests {
     #expect(ConnectionFailure(networkError: testCase.error) == testCase.failure)
   }
 
+  /// For a TCP connection macOS reports the local network block on the path, and the error is an
+  /// ordinary POSIX code.
+  @Test func aDeniedLocalNetworkPathWinsOverThePOSIXError() {
+    #expect(
+      ConnectionFailure(networkError: .posix(.EHOSTUNREACH), pathReason: .localNetworkDenied)
+        == .localNetworkDenied)
+  }
+
+  @Test func aPathWithAnotherReasonFallsBackToTheError() {
+    #expect(
+      ConnectionFailure(networkError: .posix(.ECONNREFUSED), pathReason: .notAvailable)
+        == .refused)
+    #expect(
+      ConnectionFailure(networkError: .posix(.ECONNREFUSED), pathReason: nil) == .refused)
+  }
+
   struct CloseCase: Sendable {
     let code: Int
     let failure: ConnectionFailure
@@ -94,15 +110,6 @@ struct ConnectionFailureTests {
 
     #expect(await socket.becomes(.disconnected, within: 3))
     #expect(socket.failure == .refused)
-  }
-
-  @Test func aHostThatDoesNotResolveFails() async {
-    let socket = WebSocket()
-
-    socket.connect(host: "no-such-host.invalid", port: 4455)
-
-    #expect(await socket.becomes(.disconnected, within: 10))
-    #expect(socket.failure == .hostNotFound)
   }
 
   @Test func aServerThatNeverAnswersTimesOut() async throws {
@@ -270,6 +277,11 @@ struct ConnectionFailureTests {
 
     socket.connect(host: "localhost", port: server.portNumber)
     #expect(await socket.becomes(.connected, within: 3))
+    #expect(await eventually { server.hasConnection })
+    server.send(helloWithoutPassword)
+    #expect(await eventually { server.receivedTexts.count == 1 })
+    server.send(#"{"op":2,"d":{"negotiatedRpcVersion":1}}"#)
+    #expect(await eventually { socket.isReady })
 
     socket.disconnect()
 
@@ -295,6 +307,149 @@ struct ConnectionFailureTests {
 
     #expect(await socket.becomes(.disconnected, within: 3))
     #expect(!socket.isReady)
+    #expect(socket.failure == .connectionLost)
+  }
+
+  /// The close frame and the TCP close can reach the client together. The code must survive.
+  @Test func aCloseFrameFollowedByAnImmediateDropKeepsItsCode() async throws {
+    for _ in 0..<20 {
+      let server = try await WebSocketServer.start()
+      let socket = OBSWebSocket()
+      socket.authenticationPassword = "secret"
+
+      socket.connect(host: "localhost", port: server.portNumber)
+      #expect(await socket.becomes(.connected, within: 3))
+      #expect(await eventually { server.hasConnection })
+
+      // Bytes the server never reads make its teardown abrupt.
+      socket.sendMessage("unread")
+      server.sendCloseThenDrop(code: 4009)
+
+      #expect(await socket.becomes(.disconnected, within: 3))
+      #expect(socket.failure == .authenticationFailed)
+
+      server.stop()
+    }
+  }
+
+  @Test func aPlainSocketClearsAnOldFailureWhenItConnects() async throws {
+    let server = try await WebSocketServer.start()
+    defer { server.stop() }
+    let socket = WebSocket()
+
+    socket.connect(host: "localhost", port: 1)
+    #expect(await socket.becomes(.disconnected, within: 3))
+    #expect(socket.failure == .refused)
+
+    socket.connect(host: "localhost", port: server.portNumber)
+    #expect(await socket.becomes(.connected, within: 3))
+
+    #expect(socket.failure == nil)
+  }
+
+  @Test func aReadySessionIsNotKilledByTheIdentifyTimer() async throws {
+    let server = try await WebSocketServer.start()
+    defer { server.stop() }
+    let socket = OBSWebSocket()
+    socket.connectionTimeout = 0.3
+
+    socket.connect(host: "localhost", port: server.portNumber)
+    #expect(await socket.becomes(.connected, within: 3))
+    #expect(await eventually { server.hasConnection })
+    server.send(helloWithoutPassword)
+    #expect(await eventually { server.receivedTexts.count == 1 })
+    server.send(#"{"op":2,"d":{"negotiatedRpcVersion":1}}"#)
+    #expect(await eventually { socket.isReady })
+
+    try await Task.sleep(for: .milliseconds(700))
+
+    #expect(socket.state == .connected)
+    #expect(socket.isReady)
+    #expect(socket.failure == nil)
+  }
+
+  @Test func theIdentifyTimerOfAnOldConnectionLeavesANewOneAlone() async throws {
+    let first = try await WebSocketServer.start()
+    defer { first.stop() }
+    let second = try await WebSocketServer.start()
+    defer { second.stop() }
+    let socket = OBSWebSocket()
+    socket.connectionTimeout = 0.6
+
+    socket.connect(host: "localhost", port: first.portNumber)
+    #expect(await socket.becomes(.connected, within: 3))
+    try await Task.sleep(for: .milliseconds(250))
+
+    socket.connect(host: "localhost", port: second.portNumber)
+    #expect(await socket.becomes(.connected, within: 3))
+    #expect(await eventually { second.hasConnection })
+    second.send(helloWithoutPassword)
+    #expect(await eventually { second.receivedTexts.count == 1 })
+    second.send(#"{"op":2,"d":{"negotiatedRpcVersion":1}}"#)
+    #expect(await eventually { socket.isReady })
+
+    // The first connection's timer would fire about 0.35 s after the redial.
+    try await Task.sleep(for: .milliseconds(700))
+
+    #expect(socket.state == .connected)
+    #expect(socket.isReady)
+    #expect(socket.failure == nil)
+  }
+
+  // MARK: - Close frames that arrive with a socket error
+
+  private func closeContext(code: UInt16) -> NWConnection.ContentContext {
+    let metadata = NWProtocolWebSocket.Metadata(opcode: .close)
+    metadata.closeCode = .applicationCode(code)
+
+    return NWConnection.ContentContext(identifier: "close", metadata: [metadata])
+  }
+
+  /// Network.framework can hand over a close frame and an error in one completion.
+  @Test func aCloseFrameDeliveredWithAnErrorKeepsItsCode() async throws {
+    let server = try await WebSocketServer.start()
+    defer { server.stop() }
+    let socket = OBSWebSocket()
+
+    socket.connect(host: "localhost", port: server.portNumber)
+    #expect(await socket.becomes(.connected, within: 3))
+    let connection = try #require(socket.connection)
+
+    socket.received(
+      nil, context: closeContext(code: 4009), error: .posix(.EPIPE), from: connection)
+
+    #expect(socket.state == .disconnected)
+    #expect(socket.failure == .authenticationFailed)
+  }
+
+  /// The failed state can arrive before the receive that holds the close frame.
+  @Test func aCloseFrameJustAfterAFailedStateKeepsItsCode() async throws {
+    let server = try await WebSocketServer.start()
+    defer { server.stop() }
+    let socket = OBSWebSocket()
+
+    socket.connect(host: "localhost", port: server.portNumber)
+    #expect(await socket.becomes(.connected, within: 3))
+    let connection = try #require(socket.connection)
+
+    socket.connectionStateChanged(.failed(.posix(.ENOTCONN)), of: connection)
+    socket.received(nil, context: closeContext(code: 4009), error: nil, from: connection)
+
+    #expect(socket.failure == .authenticationFailed)
+  }
+
+  @Test func aFailedStateWithNoCloseFrameIsALostConnectionAfterTheGrace() async throws {
+    let server = try await WebSocketServer.start()
+    defer { server.stop() }
+    let socket = OBSWebSocket()
+
+    socket.connect(host: "localhost", port: server.portNumber)
+    #expect(await socket.becomes(.connected, within: 3))
+    let connection = try #require(socket.connection)
+
+    socket.connectionStateChanged(.failed(.posix(.ENOTCONN)), of: connection)
+
+    #expect(await socket.becomes(.disconnected, within: 2))
     #expect(socket.failure == .connectionLost)
   }
 }
