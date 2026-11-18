@@ -14,6 +14,10 @@ private let logger = Logger(subsystem: "pro.omny.OBSWebSocket", category: "WebSo
 public class WebSocket {
   public var state: WebSocketState = .idle
 
+  /// Why the last attempt or session ended. It stays until a session becomes ready or
+  /// `disconnect()` clears it, so a client can keep showing it while it retries.
+  public internal(set) var failure: ConnectionFailure?
+
   /// How long a connection may stay in `.startingUp` before it is given up.
   public var connectionTimeout: TimeInterval = 5
 
@@ -48,10 +52,10 @@ public class WebSocket {
   }
 
   public func connect(host: String = "localhost", port: Int = 4455) {
-    disconnect()
+    endConnection()
 
     guard let url = WebSocket.makeURL(host: host, port: port) else {
-      state = .disconnected
+      fail(.invalidAddress)
       return
     }
 
@@ -112,7 +116,33 @@ public class WebSocket {
     }
   }
 
+  /// Ends the connection on the client's request. That is not a failure, so it clears one.
   public func disconnect() {
+    failure = nil
+
+    endConnection()
+  }
+
+  /// Called when the socket opens. A subclass that has a handshake of its own starts it here.
+  func connectionDidOpen() {}
+
+  /// Called when a connection that was starting or open has ended, however it ended.
+  func connectionDidEnd() {}
+
+  /// Records why the connection failed and ends it.
+  func fail(_ reason: ConnectionFailure) {
+    logger.error("The connection failed: \(String(describing: reason), privacy: .public)")
+
+    failure = reason
+
+    if state == .connected || state == .startingUp {
+      endConnection()
+    } else {
+      state = .disconnected
+    }
+  }
+
+  private func endConnection() {
     guard state == .connected || state == .startingUp else { return }
 
     state = .disconnected
@@ -124,6 +154,8 @@ public class WebSocket {
       self.connection = nil
       WebSocket.close(connection)
     }
+
+    connectionDidEnd()
   }
 
   isolated deinit {
@@ -165,6 +197,8 @@ public class WebSocket {
 
       timeoutTask?.cancel()
 
+      connectionDidOpen()
+
       receiveMessage(from: connection)
 
     case .waiting(let error), .failed(let error):
@@ -172,10 +206,11 @@ public class WebSocket {
       // connection would retry it for as long as it lives.
       logger.error("Connecting failed: \(error.localizedDescription, privacy: .public)")
 
-      disconnect()
+      // An error on a connection that was already open is a drop, whatever its code says.
+      fail(state == .connected ? .connectionLost : ConnectionFailure(networkError: error))
 
     case .cancelled:
-      disconnect()
+      fail(.connectionLost)
 
     default:
       break
@@ -201,7 +236,7 @@ public class WebSocket {
     if let error {
       logger.error("Receiving failed: \(error.localizedDescription, privacy: .public)")
 
-      disconnect()
+      fail(.connectionLost)
       return
     }
 
@@ -211,7 +246,7 @@ public class WebSocket {
 
     switch metadata?.opcode {
     case .close:
-      disconnect()
+      fail(ConnectionFailure(closeCode: WebSocket.code(of: metadata?.closeCode)))
 
     case .text:
       if let data, let text = String(data: data, encoding: .utf8) {
@@ -228,6 +263,15 @@ public class WebSocket {
   private func connectionTimedOut(_ connection: NWConnection) {
     guard connection === self.connection, state == .startingUp else { return }
 
-    disconnect()
+    fail(.timedOut)
+  }
+
+  /// The number in a close frame, or 1005 when the frame carries none.
+  private static func code(of closeCode: NWProtocolWebSocket.CloseCode?) -> Int {
+    switch closeCode {
+    case .protocolCode(let defined): Int(defined.rawValue)
+    case .applicationCode(let code), .privateCode(let code): Int(code)
+    default: 1005
+    }
   }
 }

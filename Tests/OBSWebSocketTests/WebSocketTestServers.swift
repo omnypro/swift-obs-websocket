@@ -66,9 +66,14 @@ final class WebSocketServer: @unchecked Sendable {
     transmit(Data(text.utf8), identifier: "text", metadata: metadata)
   }
 
-  func sendClose() {
+  func sendClose(code: UInt16? = nil) {
     let metadata = NWProtocolWebSocket.Metadata(opcode: .close)
-    metadata.closeCode = .protocolCode(.normalClosure)
+
+    if let code {
+      metadata.closeCode = .applicationCode(code)
+    } else {
+      metadata.closeCode = .protocolCode(.normalClosure)
+    }
 
     transmit(nil, identifier: "close", metadata: metadata)
   }
