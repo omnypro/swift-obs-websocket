@@ -43,7 +43,11 @@ public class OBSWebSocket: WebSocket {
 
   @ObservationIgnored private var requestId: Int = 0
 
-  @ObservationIgnored private var isReadyForRequests: Bool = false
+  /// True once OBS has accepted the login. The socket reports `connected` when it opens, which
+  /// is before that, and a rejected login closes it a moment later.
+  public private(set) var isReady: Bool = false
+
+  @ObservationIgnored private var identifyTask: Task<Void, Never>?
 
   @ObservationIgnored private var requestedRpcVersion: Int = 0
 
@@ -71,6 +75,27 @@ public class OBSWebSocket: WebSocket {
     return ["op": OpCode.identify, "d": data]
   }
 
+  /// OBS sends `Hello` as soon as the socket opens. A server that stays silent is not OBS, or
+  /// is not answering, so the wait is as long as the connection timeout.
+  override func connectionDidOpen() {
+    // No `super`: an old failure stays until OBS accepts the login, so a client keeps showing it.
+    identifyTask?.cancel()
+
+    identifyTask = Task { [weak self, connectionTimeout] in
+      try? await Task.sleep(for: .seconds(connectionTimeout))
+
+      guard !Task.isCancelled, let self, !isReady, state == .connected else { return }
+
+      fail(.timedOut)
+    }
+  }
+
+  override func connectionDidEnd() {
+    isReady = false
+    identifyTask?.cancel()
+    identifyTask = nil
+  }
+
   override public func handleMessage(_ message: String) {
     do {
       let json =
@@ -90,6 +115,13 @@ public class OBSWebSocket: WebSocket {
         requestedRpcVersion = min(rpcVersion, OBSWebSocket.supportedRpcVersion)
 
         if d["authentication"] is [String: String] {
+          // OBS would close the session on an empty password, so the client says so first.
+          if authenticationPassword.isEmpty {
+            fail(.authenticationRequired)
+
+            return
+          }
+
           OBSWebSocket.parseAuthentication(
             d, authenticationChallenge: &authenticationChallenge,
             authenticationSalt: &authenticationSalt)
@@ -117,12 +149,15 @@ public class OBSWebSocket: WebSocket {
         }
       } else if let negotiatedRpcVersion = d["negotiatedRpcVersion"] as? Int {
         if negotiatedRpcVersion != requestedRpcVersion {
-          disconnect()
+          fail(.unsupportedVersion)
 
           return
         }
 
-        isReadyForRequests = true
+        isReady = true
+        failure = nil
+        identifyTask?.cancel()
+        identifyTask = nil
 
         requestGetVersion()
 
@@ -197,7 +232,7 @@ public class OBSWebSocket: WebSocket {
   }
 
   public func requestGetVersion() {
-    if !isReadyForRequests {
+    if !isReady {
       logger.debug("\(OBSWebSocket.notReadyForRequestsMessage)")
 
       return
@@ -215,7 +250,7 @@ public class OBSWebSocket: WebSocket {
   }
 
   public func requestGetSceneList() {
-    if !isReadyForRequests {
+    if !isReady {
       logger.debug("\(OBSWebSocket.notReadyForRequestsMessage)")
 
       return
@@ -233,7 +268,7 @@ public class OBSWebSocket: WebSocket {
   }
 
   public func requestGetCurrentScene() {
-    if !isReadyForRequests {
+    if !isReady {
       logger.debug("\(OBSWebSocket.notReadyForRequestsMessage)")
 
       return
@@ -252,7 +287,7 @@ public class OBSWebSocket: WebSocket {
 
   public func requestSetSceneTransitionOverride(_ sceneName: String, transitionName: String = "Cut")
   {
-    if !isReadyForRequests {
+    if !isReady {
       logger.debug("\(OBSWebSocket.notReadyForRequestsMessage)")
 
       return
@@ -278,7 +313,7 @@ public class OBSWebSocket: WebSocket {
   }
 
   public func requestSetCurrentScene(_ sceneName: String) {
-    if !isReadyForRequests {
+    if !isReady {
       logger.debug("\(OBSWebSocket.notReadyForRequestsMessage)")
 
       return

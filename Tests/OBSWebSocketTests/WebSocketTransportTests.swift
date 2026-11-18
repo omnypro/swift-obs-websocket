@@ -181,12 +181,8 @@ final class RedialOnEndSocket: WebSocket {
   var redialPort: Int?
   var ends = 0
 
-  override func disconnect() {
-    let wasLive = state == .connected || state == .startingUp
-
-    super.disconnect()
-
-    guard wasLive else { return }
+  override func connectionDidEnd() {
+    super.connectionDidEnd()
 
     ends += 1
 

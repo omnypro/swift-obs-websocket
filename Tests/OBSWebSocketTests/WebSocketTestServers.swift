@@ -66,11 +66,30 @@ final class WebSocketServer: @unchecked Sendable {
     transmit(Data(text.utf8), identifier: "text", metadata: metadata)
   }
 
-  func sendClose() {
+  func sendClose(code: UInt16? = nil) {
     let metadata = NWProtocolWebSocket.Metadata(opcode: .close)
-    metadata.closeCode = .protocolCode(.normalClosure)
+
+    if let code {
+      metadata.closeCode = .applicationCode(code)
+    } else {
+      metadata.closeCode = .protocolCode(.normalClosure)
+    }
 
     transmit(nil, identifier: "close", metadata: metadata)
+  }
+
+  /// Sends a close frame with an OBS code and drops the TCP connection the moment it is written.
+  /// A proxy, or a server that does not wait for the client's reply, tears down this way.
+  func sendCloseThenDrop(code: UInt16) {
+    guard let connection = lock.withLock({ connection }) else { return }
+
+    let metadata = NWProtocolWebSocket.Metadata(opcode: .close)
+    metadata.closeCode = .applicationCode(code)
+
+    connection.send(
+      content: nil,
+      contentContext: NWConnection.ContentContext(identifier: "close", metadata: [metadata]),
+      isComplete: true, completion: .contentProcessed { _ in connection.cancel() })
   }
 
   /// Closes the TCP connection without a WebSocket close frame.
